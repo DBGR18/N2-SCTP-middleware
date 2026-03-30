@@ -1,7 +1,5 @@
 # N2 Encryption Middleware 實作說明
 
-本文件為最新實作版本，涵蓋 Middleware、gnb_proxy、mock_gnb 的現況，以及目前實際使用的加密方法與封包處理細節。
-
 ## 1. 最新實作重點
 
 - 已完成三段式代理鏈：UERANSIM gNB -> gnb_proxy -> middleware -> AMF
@@ -36,7 +34,7 @@
 6. AMF 回應後，middleware 以 TunnelReply 加密回傳給 gnb_proxy
 7. gnb_proxy 解密後，以 SCTPWrite 回送 UERANSIM gNB
 
-## 4. 現在使用的加密方法（詳細）
+## 4. 現在使用的加密方法
 
 ### 4.1 演算法組合
 
@@ -106,20 +104,20 @@
 
 ## 5. 設定檔
 
-config.yaml 主要參數：
+amfcfg.yaml：
+```yaml
+  ngapIpList:  
+    - 10.0.0.1 # add this VIP for middleware to bind and listen, and translate to real AMF IP
+    - 127.0.0.18
+```
+free5gc-gnb.yaml：
+```yaml
+ngapIp: 10.64.0.100 # modify to gnb_proxy listen IP (dummy0)
 
-- middleware_listen_ip
-- middleware_listen_port
-- middleware_vip_ip
-- middleware_sctp_local_ip
-- middleware_sctp_listen_port
-- amf_target_ip
-- amf_target_port
-- gnb_local_ip
-- gnb_proxy_listen_ip
-- gnb_proxy_listen_port
-- handshake_psk
-- read_timeout_seconds
+amfConfigs:
+  - address: 10.64.0.100 # modify to gnb_proxy listen IP (dummy0)
+    port: 38412
+```
 
 ## 6. dummy0 配置
 
@@ -177,30 +175,3 @@ cd /home/dbgr/UERANSIM
 ./build/nr-gnb -c config/free5gc-gnb.yaml
 ```
 
-## 9. 成功判斷
-
-UERANSIM gNB 成功訊號：
-
-- NG Setup Response received
-- NG Setup procedure is successful
-
-middleware 成功訊號：
-
-- gNB connected from 10.64.0.100:xxxxx
-- forwarded ... (dest translated 10.64.0.1 -> 10.0.0.1)
-- AMF->gNB encrypted ... bytes
-
-AMF 成功訊號：
-
-- Handle NGSetupRequest
-- Send NG-Setup response
-
-## 10. 疑難排解
-
-- listen ... address already in use
-  - 代表舊進程還在占埠，先停止舊 middleware/gnb_proxy 再重啟
-- middleware 無法連 AMF
-  - 檢查 AMF 是否真的在 10.0.0.1:38412 監聽（SCTP）
-  - 檢查 dummy0 是否仍有 10.0.0.1
-- AMF 出現 Received SCTP PPID != 60
-  - 高機率是你正在跑舊版 binary，請重新 build 並重啟 middleware + gnb_proxy
