@@ -1,0 +1,18 @@
+# N2 Encryption Middleware Configuration
+
+middleware_listen_ip: "10.64.0.1"
+middleware_listen_port: 29502
+middleware_vip_ip: "10.64.0.1"
+middleware_sctp_local_ip: "10.64.0.1"
+middleware_sctp_listen_port: 38413
+
+amf_target_ip: "10.0.0.1"
+amf_target_port: 38412
+
+gnb_local_ip: "10.64.0.100"
+gnb_proxy_listen_ip: "10.64.0.100"
+gnb_proxy_listen_port: 38412
+
+# 開發示範用預共享密鑰，正式環境請改為安全值。
+handshake_psk: "n2-demo-psk-change-me"
+read_timeout_seconds: 10
