@@ -1,18 +1,46 @@
-# N2 Encryption Middleware Configuration
+# N2 Zero Trust Proxy Configuration (JWT Enrollment + QUIC mTLS)
 
+# QUIC data plane listener (middleware, UDP)
 middleware_listen_ip: "10.64.0.1"
 middleware_listen_port: 29502
 middleware_vip_ip: "10.64.0.1"
+
+# Enrollment API listener (middleware, HTTPS/TCP)
+enroll_listen_ip: "10.64.0.1"
+enroll_listen_port: 8443
+enroll_url: "https://10.64.0.1:8443/enroll"
+
+# SCTP forwarding path (middleware -> AMF)
 middleware_sctp_local_ip: "10.64.0.1"
 middleware_sctp_listen_port: 38413
-
 amf_target_ip: "10.0.0.1"
 amf_target_port: 38412
 
+# gNB proxy local bindings
 gnb_local_ip: "10.64.0.100"
 gnb_proxy_listen_ip: "10.64.0.100"
 gnb_proxy_listen_port: 38412
 
-# 開發示範用預共享密鑰，正式環境請改為安全值。
-handshake_psk: "n2-demo-psk-change-me"
+# JWT enrollment
+jwt_secret: "n2-demo-jwt-secret-change-me"
+# Fill this value with middleware `-generate-jwt` output before running gnb_proxy.
+enrollment_jwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiZ25iIiwiZXhwIjoxNzc1NTcyODMzLCJpYXQiOjE3NzU1NzIyMzN9.-GpHzM6oEZaPhgTTfGD-O_sKQk60VNJQ0WHICFZgBIA"
+
+# PKI file paths
+ca_cert_path: "./pki/ca_cert.pem"
+ca_key_path: "./pki/ca_key.pem"
+server_cert_path: "./pki/middleware_server_cert.pem"
+server_key_path: "./pki/middleware_server_key.pem"
+client_cert_path: "./pki/gnb_client_cert.pem"
+client_key_path: "./pki/gnb_client_key.pem"
+
+# If empty, TLS uses IP SAN validation based on middleware_listen_ip.
+middleware_tls_server_name: ""
+
+# Runtime tuning
+client_cert_validity_hours: 24
 read_timeout_seconds: 10
+quic_idle_timeout_seconds: 90
+quic_keepalive_ms: 20000
+enrollment_read_timeout_seconds: 10
+enrollment_timeout_seconds: 10
