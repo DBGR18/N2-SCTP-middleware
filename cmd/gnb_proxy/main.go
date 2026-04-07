@@ -147,261 +147,370 @@ func loadConfig(path string) (Config, error) {
 	if net.ParseIP(cfg.GNBProxyListenIP) == nil {
 		return cfg, fmt.Errorf("invalid gnb_proxy_listen_ip: %s", cfg.GNBProxyListenIP)
 	}
-	if cfg.HandshakePSK == "" {
-		return cfg, errors.New("handshake_psk cannot be empty")
+	if _, err := url.ParseRequestURI(cfg.EnrollURL); err != nil {
+		return cfg, fmt.Errorf("invalid enroll_url: %w", err)
+	}
+	if cfg.QUICIdleTimeoutSeconds <= 0 {
+		cfg.QUICIdleTimeoutSeconds = 90
+	}
+	if cfg.QUICKeepAliveMS <= 0 {
+		cfg.QUICKeepAliveMS = 20000
+	}
+	if cfg.EnrollmentTimeoutSeconds <= 0 {
+		cfg.EnrollmentTimeoutSeconds = 10
 	}
 
 	return cfg, nil
 }
 
-func decodePSK(psk string) []byte {
-	decoded, err := base64.StdEncoding.DecodeString(psk)
-	if err == nil && len(decoded) > 0 {
-		return decoded
+func ensureParentDir(path string) error {
+	dir := filepath.Dir(path)
+	if dir == "." || dir == "" {
+		return nil
 	}
-	return []byte(psk)
+	return os.MkdirAll(dir, 0o755)
 }
 
-func newAEADFrom32BKey(key []byte) (cipher.AEAD, error) {
-	if len(key) != 32 {
-		return nil, fmt.Errorf("expect 32-byte key, got %d", len(key))
+func writeAll(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if err != nil {
+			return err
+		}
+		b = b[n:]
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-	return cipher.NewGCM(block)
+	return nil
 }
 
-func newPSKAEAD(psk string) ([]byte, cipher.AEAD, error) {
-	raw := decodePSK(psk)
-	sum := sha256.Sum256(raw)
-	aead, err := newAEADFrom32BKey(sum[:])
-	if err != nil {
-		return nil, nil, err
-	}
-	return raw, aead, nil
-}
-
-func deriveSessionKey(sharedSecret, pskRaw []byte) []byte {
-	h := sha256.New()
-	h.Write(sharedSecret)
-	h.Write(pskRaw)
-	h.Write([]byte(cipherSuiteAES256GCM))
-	key := h.Sum(nil)
-	return key[:32]
-}
-
-func readFrame(conn net.Conn) ([]byte, error) {
-	lenBuf := make([]byte, 4)
-	if _, err := io.ReadFull(conn, lenBuf); err != nil {
-		return nil, err
-	}
-	n := binary.BigEndian.Uint32(lenBuf)
-	if n == 0 || n > frameMaxSize {
-		return nil, fmt.Errorf("invalid frame length: %d", n)
-	}
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(conn, payload); err != nil {
-		return nil, err
-	}
-	return payload, nil
-}
-
-func writeFrame(conn net.Conn, payload []byte) error {
+func writeTunnelFrame(w io.Writer, stream uint16, ppid uint32, payload []byte) error {
 	if len(payload) == 0 || len(payload) > frameMaxSize {
-		return fmt.Errorf("invalid payload length: %d", len(payload))
+		return fmt.Errorf("invalid payload length %d", len(payload))
 	}
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-	if _, err := conn.Write(lenBuf); err != nil {
+	header := make([]byte, 10)
+	binary.BigEndian.PutUint16(header[0:2], stream)
+	binary.BigEndian.PutUint32(header[2:6], normalizeNGAPPPID(ppid))
+	binary.BigEndian.PutUint32(header[6:10], uint32(len(payload)))
+	if err := writeAll(w, header); err != nil {
 		return err
 	}
-	_, err := conn.Write(payload)
-	return err
+	return writeAll(w, payload)
 }
 
-func encryptEnvelope(aead cipher.AEAD, plaintext []byte) ([]byte, error) {
-	nonce := make([]byte, aead.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
+func readTunnelFrame(r io.Reader) (*TunnelFrame, error) {
+	header := make([]byte, 10)
+	if _, err := io.ReadFull(r, header); err != nil {
 		return nil, err
 	}
-	sealed := aead.Seal(nil, nonce, plaintext, nil)
-	return append(nonce, sealed...), nil
-}
-
-func decryptEnvelope(aead cipher.AEAD, envelope []byte) ([]byte, error) {
-	nonceSize := aead.NonceSize()
-	if len(envelope) <= nonceSize {
-		return nil, errors.New("ciphertext too short")
+	stream := binary.BigEndian.Uint16(header[0:2])
+	ppid := binary.BigEndian.Uint32(header[2:6])
+	length := binary.BigEndian.Uint32(header[6:10])
+	if length == 0 || length > frameMaxSize {
+		return nil, fmt.Errorf("invalid frame payload length %d", length)
 	}
-	nonce := envelope[:nonceSize]
-	ciphertext := envelope[nonceSize:]
-	return aead.Open(nil, nonce, ciphertext, nil)
-}
-
-func writeEncryptedJSON(conn net.Conn, aead cipher.AEAD, v any) error {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	envelope, err := encryptEnvelope(aead, raw)
-	if err != nil {
-		return err
-	}
-	return writeFrame(conn, envelope)
-}
-
-func readEncryptedJSON(conn net.Conn, aead cipher.AEAD, out any) error {
-	envelope, err := readFrame(conn)
-	if err != nil {
-		return err
-	}
-	raw, err := decryptEnvelope(aead, envelope)
-	if err != nil {
-		return err
-	}
-	return json.Unmarshal(raw, out)
-}
-
-func clientHandshake(conn net.Conn, pskAEAD cipher.AEAD, pskRaw []byte) (cipher.AEAD, error) {
-	curve := ecdh.X25519()
-	clientPriv, err := curve.GenerateKey(rand.Reader)
-	if err != nil {
+	payload := make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
 		return nil, err
 	}
-
-	hello := ClientHello{
-		Type:         "client_hello",
-		CipherSuites: []string{cipherSuiteAES256GCM},
-		ClientPubKey: base64.StdEncoding.EncodeToString(clientPriv.PublicKey().Bytes()),
-	}
-	if err := writeEncryptedJSON(conn, pskAEAD, hello); err != nil {
-		return nil, fmt.Errorf("write client hello: %w", err)
-	}
-
-	var serverHello ServerHello
-	if err := readEncryptedJSON(conn, pskAEAD, &serverHello); err != nil {
-		return nil, fmt.Errorf("read server hello: %w", err)
-	}
-	if serverHello.Type != "server_hello" {
-		return nil, fmt.Errorf("unexpected server hello type: %s", serverHello.Type)
-	}
-	if serverHello.SelectedCipher != cipherSuiteAES256GCM {
-		return nil, fmt.Errorf("unsupported selected cipher: %s", serverHello.SelectedCipher)
-	}
-
-	serverPubRaw, err := base64.StdEncoding.DecodeString(serverHello.ServerPubKey)
-	if err != nil {
-		return nil, fmt.Errorf("decode server pubkey: %w", err)
-	}
-	serverPub, err := curve.NewPublicKey(serverPubRaw)
-	if err != nil {
-		return nil, fmt.Errorf("parse server pubkey: %w", err)
-	}
-
-	sharedSecret, err := clientPriv.ECDH(serverPub)
-	if err != nil {
-		return nil, fmt.Errorf("derive ECDH secret: %w", err)
-	}
-	sessionKey := deriveSessionKey(sharedSecret, pskRaw)
-	return newAEADFrom32BKey(sessionKey)
+	return &TunnelFrame{Stream: stream, PPID: ppid, Payload: payload}, nil
 }
 
-func dialMiddleware(cfg Config) (net.Conn, error) {
-	remote := net.JoinHostPort(cfg.MiddlewareListenIP, strconv.Itoa(cfg.MiddlewareListenPort))
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	if ip := net.ParseIP(cfg.GNBLocalIP); ip != nil {
-		dialer.LocalAddr = &net.TCPAddr{IP: ip, Port: 0}
+func loadCACertPool(path string) (*x509.CertPool, *x509.Certificate, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read ca cert %s: %w", path, err)
 	}
-	return dialer.Dial("tcp", remote)
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(raw) {
+		return nil, nil, fmt.Errorf("append ca cert from %s failed", path)
+	}
+	block, _ := pem.Decode(raw)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, nil, fmt.Errorf("no certificate block in %s", path)
+	}
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse ca cert %s: %w", path, err)
+	}
+	return pool, cert, nil
 }
 
-func handleUERANSIMGNB(cfg Config, pskRaw []byte, pskAEAD cipher.AEAD, gnbConn *sctp.SCTPConn) {
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func loadClientKeyPair(certPath, keyPath string) (tls.Certificate, *x509.Certificate, error) {
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return tls.Certificate{}, nil, err
+	}
+	if len(cert.Certificate) == 0 {
+		return tls.Certificate{}, nil, errors.New("empty certificate chain")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return tls.Certificate{}, nil, fmt.Errorf("parse client cert leaf: %w", err)
+	}
+	cert.Leaf = leaf
+	return cert, leaf, nil
+}
+
+func hasUsableClientCert(cfg Config, caPool *x509.CertPool) (bool, error) {
+	if !fileExists(cfg.ClientCertPath) || !fileExists(cfg.ClientKeyPath) {
+		return false, nil
+	}
+
+	cert, leaf, err := loadClientKeyPair(cfg.ClientCertPath, cfg.ClientKeyPath)
+	if err != nil {
+		return false, nil
+	}
+	_ = cert
+
+	if time.Now().After(leaf.NotAfter.Add(-1 * time.Minute)) {
+		return false, nil
+	}
+
+	_, err = leaf.Verify(x509.VerifyOptions{
+		Roots:     caPool,
+		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	})
+	if err != nil {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func enrollClientCertificate(cfg Config, caPool *x509.CertPool) error {
+	if strings.TrimSpace(cfg.EnrollmentJWT) == "" {
+		return errors.New("enrollment_jwt is empty; run middleware with -generate-jwt to create one")
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("generate client private key: %w", err)
+	}
+
+	csrTemplate := &x509.CertificateRequest{
+		Subject: pkix.Name{
+			CommonName:   "gnb-proxy",
+			Organization: []string{"N2 Encryption"},
+		},
+	}
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, csrTemplate, priv)
+	if err != nil {
+		return fmt.Errorf("create CSR: %w", err)
+	}
+	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
+
+	req, err := http.NewRequest(http.MethodPost, cfg.EnrollURL, bytes.NewReader(csrPEM))
+	if err != nil {
+		return fmt.Errorf("build enroll request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.EnrollmentJWT)
+	req.Header.Set("Content-Type", "application/x-pem-file")
+
+	httpClient := &http.Client{
+		Timeout: time.Duration(cfg.EnrollmentTimeoutSeconds) * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs:    caPool,
+				MinVersion: tls.VersionTLS13,
+				ServerName: cfg.MiddlewareTLSServerName,
+			},
+		},
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("enroll request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, frameMaxSize))
+	if err != nil {
+		return fmt.Errorf("read enroll response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("enroll failed with status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	block, _ := pem.Decode(body)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return errors.New("enroll response is not a certificate PEM")
+	}
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return fmt.Errorf("parse enrolled cert: %w", err)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: caPool, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}); err != nil {
+		return fmt.Errorf("verify enrolled cert failed: %w", err)
+	}
+
+	keyDER, err := x509.MarshalECPrivateKey(priv)
+	if err != nil {
+		return fmt.Errorf("marshal client private key: %w", err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	if err := ensureParentDir(cfg.ClientKeyPath); err != nil {
+		return err
+	}
+	if err := ensureParentDir(cfg.ClientCertPath); err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(cfg.ClientKeyPath, keyPEM, 0o600); err != nil {
+		return fmt.Errorf("write client key: %w", err)
+	}
+	if err := os.WriteFile(cfg.ClientCertPath, body, 0o644); err != nil {
+		return fmt.Errorf("write client cert: %w", err)
+	}
+
+	log.Printf("Client certificate enrolled successfully and saved to %s", cfg.ClientCertPath)
+	return nil
+}
+
+func ensureClientCertificate(cfg Config, caPool *x509.CertPool) error {
+	usable, err := hasUsableClientCert(cfg, caPool)
+	if err != nil {
+		return err
+	}
+	if usable {
+		return nil
+	}
+	return enrollClientCertificate(cfg, caPool)
+}
+
+func dialQUIC(cfg Config, clientCert tls.Certificate, caPool *x509.CertPool) (*quic.Conn, *net.UDPConn, error) {
+	remoteAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(cfg.MiddlewareListenIP, strconv.Itoa(cfg.MiddlewareListenPort)))
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve middleware UDP address: %w", err)
+	}
+	localAddr := &net.UDPAddr{IP: net.ParseIP(cfg.GNBLocalIP), Port: 0}
+	udpConn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bind local UDP %s failed: %w", cfg.GNBLocalIP, err)
+	}
+
+	tlsConf := &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		NextProtos:   []string{quicALPN},
+		Certificates: []tls.Certificate{clientCert},
+		RootCAs:      caPool,
+		ServerName:   cfg.MiddlewareTLSServerName,
+	}
+
+	qConn, err := quic.Dial(context.Background(), udpConn, remoteAddr, tlsConf, &quic.Config{
+		KeepAlivePeriod: time.Duration(cfg.QUICKeepAliveMS) * time.Millisecond,
+		MaxIdleTimeout:  time.Duration(cfg.QUICIdleTimeoutSeconds) * time.Second,
+	})
+	if err != nil {
+		_ = udpConn.Close()
+		return nil, nil, fmt.Errorf("dial QUIC middleware failed: %w", err)
+	}
+
+	return qConn, udpConn, nil
+}
+
+func forwardGNBToStream(gnbConn *sctp.SCTPConn, stream *quic.Stream) error {
+	buf := make([]byte, 65535)
+	for {
+		n, info, err := gnbConn.SCTPRead(buf)
+		if err != nil {
+			return err
+		}
+
+		streamID := uint16(0)
+		ppid := ngapPPID
+		if info != nil {
+			streamID = info.Stream
+			ppid = normalizeNGAPPPID(info.PPID)
+		}
+
+		payload := append([]byte(nil), buf[:n]...)
+		if err := writeTunnelFrame(stream, streamID, ppid, payload); err != nil {
+			return err
+		}
+	}
+}
+
+func forwardStreamToGNB(stream *quic.Stream, gnbConn *sctp.SCTPConn) error {
+	for {
+		frame, err := readTunnelFrame(stream)
+		if err != nil {
+			return err
+		}
+		info := &sctp.SndRcvInfo{Stream: frame.Stream, PPID: normalizeNGAPPPID(frame.PPID)}
+		if _, err := gnbConn.SCTPWrite(frame.Payload, info); err != nil {
+			return err
+		}
+	}
+}
+
+func handleUERANSIMGNB(cfg Config, caPool *x509.CertPool, gnbConn *sctp.SCTPConn) {
 	defer gnbConn.Close()
 
-	middlewareConn, err := dialMiddleware(cfg)
-	if err != nil {
-		log.Printf("dial middleware failed: %v", err)
+	if err := ensureClientCertificate(cfg, caPool); err != nil {
+		log.Printf("enroll/check client cert failed: %v", err)
 		return
 	}
-	defer middlewareConn.Close()
 
-	if cfg.ReadTimeoutSeconds > 0 {
-		_ = middlewareConn.SetDeadline(time.Now().Add(time.Duration(cfg.ReadTimeoutSeconds) * time.Second))
-	}
-
-	sessionAEAD, err := clientHandshake(middlewareConn, pskAEAD, pskRaw)
+	clientCert, _, err := loadClientKeyPair(cfg.ClientCertPath, cfg.ClientKeyPath)
 	if err != nil {
-		log.Printf("handshake with middleware failed: %v", err)
+		log.Printf("load client certificate failed: %v", err)
 		return
 	}
-	_ = middlewareConn.SetDeadline(time.Time{})
 
-	log.Printf("gNB proxy accepted SCTP from %s and established encrypted tunnel to middleware", gnbConn.RemoteAddr())
+	qConn, udpConn, err := dialQUIC(cfg, clientCert, caPool)
+	if err != nil {
+		log.Printf("connect QUIC middleware failed: %v", err)
+		return
+	}
+	defer udpConn.Close()
+	defer qConn.CloseWithError(0, "session closed")
 
+	stream, err := qConn.OpenStreamSync(context.Background())
+	if err != nil {
+		log.Printf("open QUIC stream failed: %v", err)
+		return
+	}
+
+	log.Printf("Accepted SCTP from %s; QUIC mTLS session established to %s:%d", gnbConn.RemoteAddr(), cfg.MiddlewareListenIP, cfg.MiddlewareListenPort)
+
+	errCh := make(chan error, 2)
 	go func() {
-		buf := make([]byte, 65535)
-		for {
-			n, info, err := gnbConn.SCTPRead(buf)
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					log.Printf("UERANSIM gNB closed SCTP connection")
-					return
-				}
-				log.Printf("read from UERANSIM gNB failed: %v", err)
-				_ = middlewareConn.Close()
-				return
-			}
-
-			stream := uint16(0)
-			ppid := ngapPPID
-			if info != nil {
-				stream = info.Stream
-				ppid = normalizeNGAPPPID(info.PPID)
-			}
-
-			req := TunnelRequest{
-				DestIP:  cfg.MiddlewareVIPIP,
-				Payload: append([]byte(nil), buf[:n]...),
-				Stream:  stream,
-				PPID:    ppid,
-			}
-			if err := writeEncryptedJSON(middlewareConn, sessionAEAD, req); err != nil {
-				log.Printf("forward encrypted request to middleware failed: %v", err)
-				_ = middlewareConn.Close()
-				return
-			}
-		}
+		errCh <- forwardGNBToStream(gnbConn, stream)
+	}()
+	go func() {
+		errCh <- forwardStreamToGNB(stream, gnbConn)
 	}()
 
-	for {
-		var reply TunnelReply
-		if err := readEncryptedJSON(middlewareConn, sessionAEAD, &reply); err != nil {
-			if !errors.Is(err, io.EOF) {
-				log.Printf("read encrypted reply from middleware failed: %v", err)
-			}
-			return
-		}
+	firstErr := <-errCh
+	stream.CancelRead(0)
+	stream.CancelWrite(0)
+	_ = qConn.CloseWithError(0, "closing after one side ended")
+	_ = gnbConn.Close()
+	secondErr := <-errCh
 
-		info := &sctp.SndRcvInfo{Stream: reply.Stream, PPID: normalizeNGAPPPID(reply.PPID)}
-		if _, err := gnbConn.SCTPWrite(reply.Payload, info); err != nil {
-			log.Printf("forward reply to UERANSIM gNB failed: %v", err)
-			return
-		}
+	if firstErr != nil && !errors.Is(firstErr, io.EOF) {
+		log.Printf("gNB forwarding path ended with error: %v", firstErr)
+	}
+	if secondErr != nil && !errors.Is(secondErr, io.EOF) {
+		log.Printf("middleware forwarding path ended with error: %v", secondErr)
 	}
 }
 
-func run() error {
-	configPath := envOrDefault("N2_PROXY_CONFIG", "./config.yaml")
+func run(configPath string) error {
 	cfg, err := loadConfig(configPath)
 	if err != nil {
 		return err
 	}
 
-	pskRaw, pskAEAD, err := newPSKAEAD(cfg.HandshakePSK)
+	caPool, _, err := loadCACertPool(cfg.CACertPath)
 	if err != nil {
-		return fmt.Errorf("init psk aead: %w", err)
+		return err
 	}
 
 	laddr := &sctp.SCTPAddr{IPAddrs: []net.IPAddr{{IP: net.ParseIP(cfg.GNBProxyListenIP)}}, Port: cfg.GNBProxyListenPort}
@@ -411,8 +520,8 @@ func run() error {
 	}
 	defer ln.Close()
 
-	log.Printf("gNB proxy listening for UERANSIM on %s:%d", cfg.GNBProxyListenIP, cfg.GNBProxyListenPort)
-	log.Printf("Forward target middleware %s:%d (VIP %s)", cfg.MiddlewareListenIP, cfg.MiddlewareListenPort, cfg.MiddlewareVIPIP)
+	log.Printf("gNB proxy listening SCTP on %s:%d", cfg.GNBProxyListenIP, cfg.GNBProxyListenPort)
+	log.Printf("Middleware QUIC target %s:%d (VIP %s)", cfg.MiddlewareListenIP, cfg.MiddlewareListenPort, cfg.MiddlewareVIPIP)
 
 	for {
 		conn, err := ln.AcceptSCTP()
@@ -420,12 +529,16 @@ func run() error {
 			log.Printf("accept UERANSIM gNB SCTP failed: %v", err)
 			continue
 		}
-		go handleUERANSIMGNB(cfg, pskRaw, pskAEAD, conn)
+		go handleUERANSIMGNB(cfg, caPool, conn)
 	}
 }
 
 func main() {
-	if err := run(); err != nil {
+	defaultConfigPath := envOrDefault("N2_PROXY_CONFIG", "./config.yaml")
+	configPath := flag.String("config", defaultConfigPath, "Path to config file")
+	flag.Parse()
+
+	if err := run(*configPath); err != nil {
 		log.Fatalf("gnb_proxy exited with error: %v", err)
 	}
 }
