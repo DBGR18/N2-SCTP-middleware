@@ -24,7 +24,7 @@ gnb_proxy_listen_port: 38412
 # JWT enrollment
 jwt_secret: "n2-demo-jwt-secret-change-me"
 # Fill this value with middleware `-generate-jwt` output before running gnb_proxy.
-enrollment_jwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiZ25iIiwiZXhwIjoxNzc1NTcyODMzLCJpYXQiOjE3NzU1NzIyMzN9.-GpHzM6oEZaPhgTTfGD-O_sKQk60VNJQ0WHICFZgBIA"
+enrollment_jwt: ""
 
 # PKI file paths
 ca_cert_path: "./pki/ca_cert.pem"
