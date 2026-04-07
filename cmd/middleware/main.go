@@ -1,72 +1,87 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/ecdh"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
+	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
-	"sync"
+	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/ishidawataru/sctp"
+	"github.com/quic-go/quic-go"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	cipherSuiteAES256GCM = "AES-256-GCM"
-	frameMaxSize         = 1024 * 1024
-	ngapPPID             = uint32(60)
+	frameMaxSize = 1024 * 1024
+	ngapPPID     = uint32(60)
+	quicALPN     = "n2-quic-v1"
 )
 
 type Config struct {
-	MiddlewareListenIP    string `yaml:"middleware_listen_ip"`
-	MiddlewareListenPort  int    `yaml:"middleware_listen_port"`
-	MiddlewareVIPIP       string `yaml:"middleware_vip_ip"`
-	MiddlewareSCTPLocalIP string `yaml:"middleware_sctp_local_ip"`
-	MiddlewareSCTPPort    int    `yaml:"middleware_sctp_listen_port"`
-	AMFTargetIP           string `yaml:"amf_target_ip"`
-	AMFTargetPort         int    `yaml:"amf_target_port"`
-	GNBLocalIP            string `yaml:"gnb_local_ip"`
-	HandshakePSK          string `yaml:"handshake_psk"`
-	ReadTimeoutSeconds    int    `yaml:"read_timeout_seconds"`
+	MiddlewareListenIP       string `yaml:"middleware_listen_ip"`
+	MiddlewareListenPort     int    `yaml:"middleware_listen_port"`
+	MiddlewareVIPIP          string `yaml:"middleware_vip_ip"`
+	EnrollListenIP           string `yaml:"enroll_listen_ip"`
+	EnrollListenPort         int    `yaml:"enroll_listen_port"`
+	MiddlewareSCTPLocalIP    string `yaml:"middleware_sctp_local_ip"`
+	MiddlewareSCTPPort       int    `yaml:"middleware_sctp_listen_port"`
+	AMFTargetIP              string `yaml:"amf_target_ip"`
+	AMFTargetPort            int    `yaml:"amf_target_port"`
+	JWTSecret                string `yaml:"jwt_secret"`
+	CACertPath               string `yaml:"ca_cert_path"`
+	CAKeyPath                string `yaml:"ca_key_path"`
+	ServerCertPath           string `yaml:"server_cert_path"`
+	ServerKeyPath            string `yaml:"server_key_path"`
+	ClientCertValidityHours  int    `yaml:"client_cert_validity_hours"`
+	ReadTimeoutSeconds       int    `yaml:"read_timeout_seconds"`
+	QUICIdleTimeoutSeconds   int    `yaml:"quic_idle_timeout_seconds"`
+	QUICKeepAliveMS          int    `yaml:"quic_keepalive_ms"`
+	EnrollmentReadTimeoutSec int    `yaml:"enrollment_read_timeout_seconds"`
 }
 
-type ClientHello struct {
-	Type         string   `json:"type"`
-	CipherSuites []string `json:"cipher_suites"`
-	ClientPubKey string   `json:"client_pub_key"`
+type EnrollmentClaims struct {
+	Role string `json:"role"`
+	jwt.RegisteredClaims
 }
 
-type ServerHello struct {
-	Type           string `json:"type"`
-	SelectedCipher string `json:"selected_cipher"`
-	ServerPubKey   string `json:"server_pub_key"`
+type TunnelFrame struct {
+	Stream  uint16
+	PPID    uint32
+	Payload []byte
 }
 
-type TunnelRequest struct {
-	DestIP  string `json:"dest_ip"`
-	Payload []byte `json:"payload"`
-	Stream  uint16 `json:"stream,omitempty"`
-	PPID    uint32 `json:"ppid,omitempty"`
+type PKI struct {
+	CACert      *x509.Certificate
+	CAKey       *ecdsa.PrivateKey
+	CACertPEM   []byte
+	ServerTLS   tls.Certificate
+	ServerLeaf  *x509.Certificate
+	ServerRoots *x509.CertPool
 }
 
-type TunnelReply struct {
-	FromIP  string `json:"from_ip"`
-	Payload []byte `json:"payload"`
-	Stream  uint16 `json:"stream,omitempty"`
-	PPID    uint32 `json:"ppid,omitempty"`
+type ProxyService struct {
+	cfg     Config
+	nextSID atomic.Uint64
 }
 
 func normalizeNGAPPPID(ppid uint32) uint32 {
@@ -76,36 +91,27 @@ func normalizeNGAPPPID(ppid uint32) uint32 {
 	return ppid
 }
 
-type Session struct {
-	id       uint64
-	gnbConn  net.Conn
-	amfConn  *sctp.SCTPConn
-	dataAEAD cipher.AEAD
-}
-
-type ProxyService struct {
-	cfg     Config
-	pskRaw  []byte
-	pskAEAD cipher.AEAD
-
-	nextID      atomic.Uint64
-	sessionsMu  sync.RWMutex
-	sessions    map[uint64]*Session
-	amfToGnBMap map[*sctp.SCTPConn]uint64
-}
-
 func defaultConfig() Config {
 	return Config{
-		MiddlewareListenIP:    "10.64.0.1",
-		MiddlewareListenPort:  29502,
-		MiddlewareVIPIP:       "10.64.0.1",
-		MiddlewareSCTPLocalIP: "10.64.0.1",
-		MiddlewareSCTPPort:    38413,
-		AMFTargetIP:           "10.0.0.1",
-		AMFTargetPort:         38412,
-		GNBLocalIP:            "10.64.0.100",
-		HandshakePSK:          "n2-demo-psk-change-me",
-		ReadTimeoutSeconds:    10,
+		MiddlewareListenIP:       "10.64.0.1",
+		MiddlewareListenPort:     29502,
+		MiddlewareVIPIP:          "10.64.0.1",
+		EnrollListenIP:           "10.64.0.1",
+		EnrollListenPort:         8443,
+		MiddlewareSCTPLocalIP:    "10.64.0.1",
+		MiddlewareSCTPPort:       38413,
+		AMFTargetIP:              "10.0.0.1",
+		AMFTargetPort:            38412,
+		JWTSecret:                "n2-demo-jwt-secret-change-me",
+		CACertPath:               "./pki/ca_cert.pem",
+		CAKeyPath:                "./pki/ca_key.pem",
+		ServerCertPath:           "./pki/middleware_server_cert.pem",
+		ServerKeyPath:            "./pki/middleware_server_key.pem",
+		ClientCertValidityHours:  24,
+		ReadTimeoutSeconds:       10,
+		QUICIdleTimeoutSeconds:   90,
+		QUICKeepAliveMS:          20000,
+		EnrollmentReadTimeoutSec: 10,
 	}
 }
 
