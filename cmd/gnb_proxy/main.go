@@ -1,68 +1,64 @@
 package main
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
-	"crypto/ecdh"
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ishidawataru/sctp"
+	"github.com/quic-go/quic-go"
 	"gopkg.in/yaml.v3"
 )
 
 const (
-	cipherSuiteAES256GCM = "AES-256-GCM"
-	frameMaxSize         = 1024 * 1024
-	ngapPPID             = uint32(60)
+	frameMaxSize = 1024 * 1024
+	ngapPPID     = uint32(60)
+	quicALPN     = "n2-quic-v1"
 )
 
 type Config struct {
-	MiddlewareListenIP   string `yaml:"middleware_listen_ip"`
-	MiddlewareListenPort int    `yaml:"middleware_listen_port"`
-	MiddlewareVIPIP      string `yaml:"middleware_vip_ip"`
-	GNBLocalIP           string `yaml:"gnb_local_ip"`
-	GNBProxyListenIP     string `yaml:"gnb_proxy_listen_ip"`
-	GNBProxyListenPort   int    `yaml:"gnb_proxy_listen_port"`
-	HandshakePSK         string `yaml:"handshake_psk"`
-	ReadTimeoutSeconds   int    `yaml:"read_timeout_seconds"`
+	MiddlewareListenIP       string `yaml:"middleware_listen_ip"`
+	MiddlewareListenPort     int    `yaml:"middleware_listen_port"`
+	MiddlewareVIPIP          string `yaml:"middleware_vip_ip"`
+	GNBLocalIP               string `yaml:"gnb_local_ip"`
+	GNBProxyListenIP         string `yaml:"gnb_proxy_listen_ip"`
+	GNBProxyListenPort       int    `yaml:"gnb_proxy_listen_port"`
+	EnrollURL                string `yaml:"enroll_url"`
+	EnrollmentJWT            string `yaml:"enrollment_jwt"`
+	CACertPath               string `yaml:"ca_cert_path"`
+	ClientCertPath           string `yaml:"client_cert_path"`
+	ClientKeyPath            string `yaml:"client_key_path"`
+	MiddlewareTLSServerName  string `yaml:"middleware_tls_server_name"`
+	ReadTimeoutSeconds       int    `yaml:"read_timeout_seconds"`
+	QUICIdleTimeoutSeconds   int    `yaml:"quic_idle_timeout_seconds"`
+	QUICKeepAliveMS          int    `yaml:"quic_keepalive_ms"`
+	EnrollmentTimeoutSeconds int    `yaml:"enrollment_timeout_seconds"`
 }
 
-type ClientHello struct {
-	Type         string   `json:"type"`
-	CipherSuites []string `json:"cipher_suites"`
-	ClientPubKey string   `json:"client_pub_key"`
-}
-
-type ServerHello struct {
-	Type           string `json:"type"`
-	SelectedCipher string `json:"selected_cipher"`
-	ServerPubKey   string `json:"server_pub_key"`
-}
-
-type TunnelRequest struct {
-	DestIP  string `json:"dest_ip"`
-	Payload []byte `json:"payload"`
-	Stream  uint16 `json:"stream,omitempty"`
-	PPID    uint32 `json:"ppid,omitempty"`
-}
-
-type TunnelReply struct {
-	FromIP  string `json:"from_ip"`
-	Payload []byte `json:"payload"`
-	Stream  uint16 `json:"stream,omitempty"`
-	PPID    uint32 `json:"ppid,omitempty"`
+type TunnelFrame struct {
+	Stream  uint16
+	PPID    uint32
+	Payload []byte
 }
 
 func normalizeNGAPPPID(ppid uint32) uint32 {
@@ -74,14 +70,22 @@ func normalizeNGAPPPID(ppid uint32) uint32 {
 
 func defaultConfig() Config {
 	return Config{
-		MiddlewareListenIP:   "10.64.0.1",
-		MiddlewareListenPort: 29502,
-		MiddlewareVIPIP:      "10.64.0.1",
-		GNBLocalIP:           "10.64.0.100",
-		GNBProxyListenIP:     "10.64.0.100",
-		GNBProxyListenPort:   38412,
-		HandshakePSK:         "n2-demo-psk-change-me",
-		ReadTimeoutSeconds:   10,
+		MiddlewareListenIP:       "10.64.0.1",
+		MiddlewareListenPort:     29502,
+		MiddlewareVIPIP:          "10.64.0.1",
+		GNBLocalIP:               "10.64.0.100",
+		GNBProxyListenIP:         "10.64.0.100",
+		GNBProxyListenPort:       38412,
+		EnrollURL:                "https://10.64.0.1:8443/enroll",
+		EnrollmentJWT:            "",
+		CACertPath:               "./pki/ca_cert.pem",
+		ClientCertPath:           "./pki/gnb_client_cert.pem",
+		ClientKeyPath:            "./pki/gnb_client_key.pem",
+		MiddlewareTLSServerName:  "",
+		ReadTimeoutSeconds:       10,
+		QUICIdleTimeoutSeconds:   90,
+		QUICKeepAliveMS:          20000,
+		EnrollmentTimeoutSeconds: 10,
 	}
 }
 
@@ -123,8 +127,16 @@ func loadConfig(path string) (Config, error) {
 	cfg.GNBLocalIP = envOrDefault("GNB_LOCAL_IP", cfg.GNBLocalIP)
 	cfg.GNBProxyListenIP = envOrDefault("GNB_PROXY_LISTEN_IP", cfg.GNBProxyListenIP)
 	cfg.GNBProxyListenPort = envIntOrDefault("GNB_PROXY_LISTEN_PORT", cfg.GNBProxyListenPort)
-	cfg.HandshakePSK = envOrDefault("HANDSHAKE_PSK", cfg.HandshakePSK)
+	cfg.EnrollURL = envOrDefault("ENROLL_URL", cfg.EnrollURL)
+	cfg.EnrollmentJWT = envOrDefault("ENROLLMENT_JWT", cfg.EnrollmentJWT)
+	cfg.CACertPath = envOrDefault("CA_CERT_PATH", cfg.CACertPath)
+	cfg.ClientCertPath = envOrDefault("CLIENT_CERT_PATH", cfg.ClientCertPath)
+	cfg.ClientKeyPath = envOrDefault("CLIENT_KEY_PATH", cfg.ClientKeyPath)
+	cfg.MiddlewareTLSServerName = envOrDefault("MIDDLEWARE_TLS_SERVER_NAME", cfg.MiddlewareTLSServerName)
 	cfg.ReadTimeoutSeconds = envIntOrDefault("READ_TIMEOUT_SECONDS", cfg.ReadTimeoutSeconds)
+	cfg.QUICIdleTimeoutSeconds = envIntOrDefault("QUIC_IDLE_TIMEOUT_SECONDS", cfg.QUICIdleTimeoutSeconds)
+	cfg.QUICKeepAliveMS = envIntOrDefault("QUIC_KEEPALIVE_MS", cfg.QUICKeepAliveMS)
+	cfg.EnrollmentTimeoutSeconds = envIntOrDefault("ENROLLMENT_TIMEOUT_SECONDS", cfg.EnrollmentTimeoutSeconds)
 
 	if net.ParseIP(cfg.MiddlewareListenIP) == nil {
 		return cfg, fmt.Errorf("invalid middleware_listen_ip: %s", cfg.MiddlewareListenIP)
